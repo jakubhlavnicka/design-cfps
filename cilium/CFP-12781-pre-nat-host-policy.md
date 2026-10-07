@@ -12,16 +12,17 @@
 
 **Issue:** [cilium/cilium#12781](https://github.com/cilium/cilium/issues/12781)
 
-> **Note:** This is an alternative design to
-> [CFP-12781-host-firewall-before-nodeport-dnat.md](./CFP-12781-host-firewall-before-nodeport-dnat.md),
-> written in response to review feedback suggesting that the pre-NAT hook point be exposed as an
-> explicit policy API field rather than as a configuration flag that changes the meaning of the
-> existing `ingress` field. See [Comparison With the Configuration-Flag
-> Design](#comparison-with-the-configuration-flag-design).
+> **Note:** This design supersedes the earlier revision of this CFP, which proposed a
+> `hostFirewall.enforceBeforeNodePortDNAT` configuration flag. It was rewritten in response to review
+> feedback suggesting that the pre-NAT hook point be exposed as an explicit policy API field rather
+> than as a configuration flag that silently changes the meaning of the existing `ingress` field. The
+> earlier revision remains available in the history of
+> [cilium/design-cfps#97](https://github.com/cilium/design-cfps/pull/97).
 >
-> The field was suggested in review under the name `preSNATIngress`. This document uses
-> `preNATIngress`, because the hook point precedes both DNAT and SNAT; the naming is itself an open
-> question, see [Key Question: Field Naming](#key-question-field-naming).
+> **One question remains open for SIG-Policy:** whether this stage belongs on
+> `CiliumClusterwideNetworkPolicy` as a new field or in a dedicated kind — see [Open Question: New
+> Field vs. New Kind](#open-question-new-field-vs-new-kind). Every other question raised in review is
+> settled in [Resolved Design Decisions](#resolved-design-decisions).
 
 ## Summary
 
@@ -104,7 +105,7 @@ matching is written as a pre-NAT rule and is enforced as one.
 * L7 policy at the pre-NAT stage. The packet has not yet been steered to a proxy and the connection
   has no established endpoint context; only L3/L4 rules are supported.
 * Egress. A symmetric post-SNAT egress stage is plausible but is deliberately out of scope; see
-  [Key Question: Egress Counterpart](#key-question-egress-counterpart).
+  [Egress Counterpart](#egress-counterpart) for the rationale.
 * Replacing or deprecating the existing `ingress` field. Both stages coexist and both are enforced.
 * Per-service policy. This is node-scoped policy; it matches on the packet as it arrives on the
   wire, not on the Kubernetes Service object it will be resolved to.
@@ -121,6 +122,14 @@ A new field `preNATIngress` is added to `CiliumClusterwideNetworkPolicySpec` (an
 The motivating policy becomes:
 
 ```yaml
+apiVersion: cilium.io/v2
+kind: CiliumCIDRGroup
+metadata:
+  name: allowed-nodeport-source
+spec:
+  externalCIDRs:
+  - 142.217.23.90/32
+---
 apiVersion: cilium.io/v2
 kind: CiliumClusterwideNetworkPolicy
 metadata:
@@ -168,42 +177,13 @@ The author can now read the enforcement point off the object. A rule under `preN
 `port: "30500"` matches the NodePort; the same rule under `ingress` matches a host-terminated port
 30500 and will never see NodePort traffic.
 
-### Enforcement Semantics
-
-**Scope.** `preNATIngress` applies to traffic arriving on native devices on nodes selected by
-`nodeSelector`, evaluated before the NodePort/LB logic in `from-netdev`. It applies to *all* such
-traffic, not only traffic that turns out to match an LB frontend — see [Key Question: Scope of the
-Pre-NAT Stage](#key-question-scope-of-the-pre-nat-stage).
-
 **Default-deny is scoped to the stage.** Cilium's rule is that an endpoint selected by any rule in a
-direction becomes default-deny in that direction. Here that rule is applied *per stage*:
-
-| Cluster state | Pre-NAT stage | `ingress` stage |
-| --- | --- | --- |
-| No policy with `preNATIngress` selects the node | allow all (pass through) | unchanged |
-| At least one policy with `preNATIngress` selects the node | default-deny; only listed traffic allowed | unchanged |
-
-A policy that sets only `ingress` does **not** put the node's pre-NAT stage into default-deny, and a
-policy that sets only `preNATIngress` does **not** put the host endpoint's `ingress` stage into
-default-deny. This is what makes the change non-breaking: existing objects cannot activate the new
-stage.
-
-**The two stages are conjunctive.** A packet that is subject to both must be allowed by both. For
-NodePort traffic to a pod backend, the packet passes the pre-NAT stage, is DNATed, and is then
-subject to the *backend pod's* ingress policy as it is today — the host `ingress` field is not
-consulted for forwarded traffic. For traffic terminating on the host itself, the packet passes the
-pre-NAT stage and then the host `ingress` stage. The pre-NAT stage is therefore strictly additive:
-it can only cause drops, never allow traffic that a later stage denies.
-
-**Connection tracking.** Only the first packet of a connection in the forward direction is evaluated
-against `preNATIngress`. Established connections and reply traffic bypass the stage, using the same
-conntrack semantics as the existing host firewall. This is required for correctness — the reply of a
-NodePort connection arrives already-translated and must not be matched against pre-NAT rules — and
-it bounds the per-packet cost to new flows.
-
-**Auditing.** `enable-policy: audit` and per-node policy audit mode apply to the pre-NAT stage as
-well; denied packets are reported and forwarded rather than dropped, so the stage can be rolled out
-observably.
+direction becomes default-deny in that direction. Here that rule is applied *per stage*: a policy
+that sets only `ingress` does not put a node's pre-NAT stage into default-deny, and a policy that
+sets only `preNATIngress` does not put the host endpoint's `ingress` stage into default-deny. The
+pre-NAT stage is enforced only on nodes selected by at least one policy that populates
+`preNATIngress`; everywhere else it passes traffic through untouched. This is what makes the change
+non-breaking — no existing object can activate the new stage.
 
 ### Datapath
 
@@ -243,7 +223,7 @@ recirculate: CILIUM_CALL_IPV4_FROM_NETDEV
 NodePort / LB processing (DNAT, SNAT) --> existing flow unchanged
 ```
 
-Notes on the mechanism, largely carried over from the configuration-flag design:
+Notes on the mechanism:
 
 * The policy check runs in its own tail call frame (`CILIUM_CALL_IPV4_PRE_NAT_HOST_POLICY` /
   `CILIUM_CALL_IPV6_PRE_NAT_HOST_POLICY`) to stay within the 512-byte BPF stack limit, then
@@ -296,37 +276,6 @@ honoured, rather than accepting them and under-enforcing:
   the stage is unavailable on a node (host firewall disabled, NodePort disabled, or the escape-hatch
   flag set), so that a policy which cannot be enforced is visibly not enforced.
 
-## Comparison With the Configuration-Flag Design
-
-The companion CFP proposes `hostFirewall.enforceBeforeNodePortDNAT`, a cluster-wide flag that moves
-where the existing `ingress` field is evaluated. The two designs solve the same datapath problem and
-share most of the BPF work; they differ in what the API says.
-
-| | Config flag (`enforceBeforeNodePortDNAT`) | Policy field (`preNATIngress`) |
-| --- | --- | --- |
-| Meaning of an `ingress` rule | depends on cluster configuration | fixed |
-| Breaking change risk | real; flag changes existing policies' behaviour | none; existing objects unaffected |
-| Opt-in granularity | whole cluster | per rule |
-| Can express "deny at the wire, allow at the host" | no — one stage, one field | yes — the stages are separate |
-| Portability of a policy object | needs matching cluster config | self-describing |
-| Path to default-on | breaking; needs a major release | not needed; nothing to flip |
-| API surface added | one Helm value | one CRD field, plus validation |
-| Datapath work | new tail calls, skip flag, recirculation | same, plus a second policy map |
-
-The decisive argument for the field is portability. A `CiliumClusterwideNetworkPolicy` is an object
-that gets committed to a repository and applied to many clusters. Under the flag design, the same
-YAML enforces different things depending on a Helm value the policy author may not control and
-cannot see from the object — and the failure mode of the mismatch is silent under-enforcement of a
-security policy. Under the field design, the enforcement point travels with the rule.
-
-The secondary argument is expressiveness. Several of the motivating deployments want *both* stages:
-a tight allowlist on what may enter the node from the outside world, and a separate, looser policy
-on what may terminate on the host. The flag design forces a single choice for the whole cluster; the
-field design lets one object state both.
-
-The cost is a permanent addition to the policy API, which is a higher bar than a Helm value and
-harder to withdraw.
-
 ## Why `loadBalancerSourceRanges` Is Not Sufficient
 
 Kubernetes `Service.spec.loadBalancerSourceRanges` provides per-service source IP filtering for
@@ -370,180 +319,66 @@ The Service "example" is invalid: spec.LoadBalancerSourceRanges: Forbidden: may 
 Source range filtering via this mechanism is therefore unavailable for NodePort services at the
 Kubernetes API level, regardless of what the underlying CNI supports.
 
-## Impacts / Key Questions
+## Resolved Design Decisions
 
-### Impact: Policy API Growth
+These were raised as open questions in review. They are recorded here as settled, with the rejected
+alternatives and the costs accepted retained so that they do not have to be rediscovered.
 
-Adding a third top-level rule list to `CiliumClusterwideNetworkPolicy` — alongside `ingress`,
-`ingressDeny`, `egress`, `egressDeny` — enlarges an API that is already large, and invites the
-question of whether `preNATIngressDeny` must follow. The proposal is to ship `preNATIngress` alone
-and add a deny variant only if a concrete need appears; `fromCIDRSet.except` covers the known
-exclusion use cases.
+### Field Naming
 
-### Impact: A New Silent-Failure Mode of Its Own
+**Decision: `preNATIngress`.**
 
-If an operator writes `preNATIngress` on a cluster where host firewall or NodePort is disabled, the
-rules do nothing. This is mitigated by the status condition described under
-[Observability](#observability), but it is a real cost of the design and worth weighing against the
-flag alternative, where the same mismatch is at least visible in one place.
-
-### Impact: Per-Packet Cost on New Flows
-
-New flows arriving on native devices take an extra tail call, an ipcache lookup, and a policy map
-lookup before LB processing. Established flows are unaffected. The cost is only paid on nodes where
-the stage is active. Benchmarking on the NodePort request-rate path is required before merge, with
-an explicit target of no measurable regression when no `preNATIngress` policy exists.
-
-### Key Question: Field Naming
-
-The field names the hook point, so the name should be accurate about where it is.
-
-#### Option 1: `preNATIngress`
-
-##### Pros
-
-* Accurate: the hook precedes DNAT (destination rewrite) and SNAT (source rewrite), and the
-  motivating use cases depend on both.
-* Reads correctly for the port-matching use case, which is a DNAT concern, not an SNAT one.
-
-##### Cons
-
-* "NAT" is broad; a reader may wonder which NAT, given the datapath performs several.
-
-#### Option 2: `preSNATIngress` (as suggested in review)
-
-##### Pros
-
-* Names the transformation operators most often complain about — losing the client source IP.
-
-##### Cons
-
-* Understates the change: the primary motivating rule matches a *destination port*, which is a DNAT
-  concern. A user reading `preSNATIngress` has no reason to expect it fixes port matching.
-
-#### Option 3: A stage discriminator instead of a new field
-
-```yaml
-spec:
-  ingress:
-  - enforcementStage: PreNAT      # default: PostNAT
-    fromEntities: [world]
-```
-
-##### Pros
-
-* No new top-level field; extends to future stages without further API growth.
-* Deny variants come for free.
-
-##### Cons
-
-* Mixing stages within one list makes default-deny scoping harder to read, since the reader must
-  scan every rule to know which stages are activated.
-* A per-rule field in a list is a weaker signal than a top-level field for something as consequential
-  as enforcement point.
-
-### Key Question: Scope of the Pre-NAT Stage
-
-Does `preNATIngress` apply to all traffic entering the native device, or only to traffic that
-resolves to an LB frontend?
-
-#### Option 1: All traffic on the native device (proposed)
-
-##### Pros
-
-* Simple, uniform mental model: "this is policy on the packet as it arrived".
-* Lets the field express a general node-perimeter policy, which is what several of the motivating
-  deployments actually want.
-* No dependency on LB lookup ordering; the verdict does not change when a Service is created or
-  deleted.
-
-##### Cons
-
-* Broader blast radius: an incomplete allowlist can black-hole traffic that has nothing to do with
-  NodePort, including control plane and health traffic.
-* Requires authors to think about VXLAN/Geneve, WireGuard, and IPsec traffic that terminates on the
-  node.
-
-#### Option 2: Only traffic matching an LB frontend
-
-##### Pros
-
-* Narrowly targeted at the reported problem; much smaller blast radius.
-
-##### Cons
-
-* Requires the LB lookup before the policy check, so the "original" packet is only original by
-  bookkeeping, and the verdict becomes coupled to Service churn.
-* Cannot express "block the NodePort range", since a port with no Service behind it does not match a
-  frontend — which is exactly rule (1) of the motivating example.
-
-### Key Question: Interaction With Encapsulated and Encrypted Traffic
-
-Traffic arriving in a VXLAN/Geneve tunnel, or as ESP under IPsec, is opaque at the `from-netdev`
-hook. The proposal is that `preNATIngress` matches the *outer* packet — the tunnel or ESP packet as
-it arrived — and that inner traffic continues to be subject to the existing post-decapsulation
-policy stages. This is defensible but needs to be stated loudly in documentation, since a rule
-allowing `fromEntities: cluster` to the tunnel port is what keeps a cluster reachable, and its
-absence under default-deny will partition the cluster. An alternative is to exempt tunnel and ESP
-traffic from the stage entirely; that is safer but makes the stage unable to police the tunnel
-endpoint itself.
+The field was suggested in review as `preSNATIngress`. `preNATIngress` is used instead because the
+hook precedes both DNAT (destination rewrite) and SNAT (source rewrite), and the primary motivating
+rule matches a *destination port* — a DNAT concern. A user reading `preSNATIngress` has no reason to
+expect that it fixes port matching, which understates the change. The cost accepted is that "NAT" is
+broad: the datapath performs several translations, so documentation must state which ones this hook
+precedes.
 
 
-#### Option 1: Ingress only, now (proposed)
+### Egress Counterpart
 
-##### Pros
+**Decision: ingress only in the first iteration.**
 
-* Matches the reported use cases; no speculative API.
-* Keeps the first iteration reviewable.
+A symmetric post-SNAT egress stage is plausible, but there is no concrete demand for it, and adding
+it would double the datapath and test surface for speculative benefit. Shipping ingress alone matches
+the reported use cases and keeps the first iteration reviewable.
 
-##### Cons
+The risk accepted is that the naming and structure chosen now constrain the egress side if it is
+added later. `preNATIngress` admits an obvious `preNATEgress` counterpart, which bounds that risk.
 
-* If the egress side is added later, the naming and structure chosen now constrain it.
+## Open Question: New Field vs. New Kind
 
-#### Option 2: Both directions in one change
-
-##### Pros
-
-* Symmetric API; one design discussion instead of two.
-
-##### Cons
-
-* No concrete demand for the egress side; doubles datapath and test surface for speculative benefit.
-
-### Key Question: New Field vs. New Kind
+This is the one decision the design does not settle, and the question this CFP is being taken to
+SIG-Policy to resolve.
 
 An alternative to extending `CiliumClusterwideNetworkPolicy` is a dedicated kind, e.g.
 `CiliumNodePerimeterPolicy`.
 
-#### Option 1: New field on `CiliumClusterwideNetworkPolicy` (proposed)
+### Option 1: New field on `CiliumClusterwideNetworkPolicy` (proposed)
 
-##### Pros
+#### Pros
 
 * Reuses `nodeSelector`, the rule types, `CiliumCIDRGroup` references, status reporting, and the
   entire policy pipeline.
 * Node policy stays in one object, so an operator reads one YAML to know what a node enforces.
 
-##### Cons
+#### Cons
 
 * Adds to an already-large CRD, and makes `CiliumClusterwideNetworkPolicy` mean two different things
   depending on which fields are set.
 
-#### Option 2: A separate CRD
+### Option 2: A separate CRD
 
-##### Pros
+#### Pros
 
 * Clean separation; the new stage's restrictions (no L7, no auth, node-scoped only) are expressed by
   the type rather than by validation rules on a general-purpose type.
 * Independent RBAC, so the perimeter policy can be owned by the platform team while application
   teams retain `CiliumClusterwideNetworkPolicy`.
 
-##### Cons
+#### Cons
 
 * Duplicates a large amount of schema and controller code.
 * Two objects must now be read together to understand what a node enforces, and their interaction
   becomes a documentation burden.
-
-The RBAC separation is a genuine argument for the separate kind and matches the motivating
-deployment model, where a platform operator — not the application owner — sets the node perimeter.
-It is the strongest counter-argument to the proposal as written and is offered here for discussion
-rather than settled.
